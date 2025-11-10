@@ -1,6 +1,4 @@
-// server.js
-// Chatwoot (webhook) ↔ ElevenLabs Conversational AI ↔ Chatwoot (API) → WhatsApp
-
+// server.js — Chatwoot ↔ ElevenLabs (multi-strategy) ↔ Chatwoot
 import express from "express";
 import fetch from "node-fetch";
 
@@ -16,20 +14,15 @@ const {
   ELEVEN_AGENT_ID
 } = process.env;
 
-const short = (s, n = 160) => (typeof s === "string" ? s.slice(0, n) : s);
+const short = (s, n = 240) =>
+  typeof s === "string" ? s.slice(0, n) : JSON.stringify(s || {}).slice(0, n);
 
-// Mappa: conversationId Chatwoot -> conversationId ElevenLabs (convai)
-const cwToEleven = new Map();
-
-/** ---- helper: chiama endpoint "semplice" (se disponibile) ---- */
+// -------------------- ELEVEN HELPERS --------------------
 async function elevenSimpleRespond(text) {
   const url = `https://api.elevenlabs.io/v1/agents/${ELEVEN_AGENT_ID}/respond`;
   const r = await fetch(url, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "xi-api-key": ELEVEN_API_KEY
-    },
+    headers: { "Content-Type": "application/json", "xi-api-key": ELEVEN_API_KEY },
     body: JSON.stringify({ input: text })
   });
   let j = {};
@@ -37,64 +30,70 @@ async function elevenSimpleRespond(text) {
   return { status: r.status, data: j };
 }
 
-/** ---- helper: crea/recupera una conversation convai ---- */
-async function elevenEnsureConversation(cwConvId) {
-  // se già esiste, la riuso
-  if (cwToEleven.has(cwConvId)) return cwToEleven.get(cwConvId);
-
-  // creo nuova conversation
-  const r = await fetch("https://api.elevenlabs.io/v1/convai/conversations", {
+// Variante A: create conversation (convai) + message
+async function convaiCreateConversation() {
+  const url = "https://api.elevenlabs.io/v1/convai/conversations";
+  const r = await fetch(url, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "xi-api-key": ELEVEN_API_KEY
-    },
+    headers: { "Content-Type": "application/json", "xi-api-key": ELEVEN_API_KEY },
     body: JSON.stringify({ agent_id: ELEVEN_AGENT_ID })
   });
-  const j = await r.json().catch(() => ({}));
-  const elevenConvId = j?.conversation_id || j?.id;
-  if (elevenConvId) cwToEleven.set(cwConvId, elevenConvId);
-  return elevenConvId;
+  const bodyText = await r.text();
+  let j = {};
+  try { j = JSON.parse(bodyText); } catch {}
+  const id = j?.conversation_id || j?.id;
+  console.log("[CONVAI create] status:", r.status, "| body:", short(bodyText));
+  return { status: r.status, id, raw: j };
 }
 
-/** ---- helper: invia un messaggio e ottieni la reply testuale (convai) ---- */
-async function elevenConvaiReply(cwConvId, userText) {
-  const elevenConvId = await elevenEnsureConversation(cwConvId);
-  if (!elevenConvId) {
-    return { ok: false, reply: null, info: "no_conversation" };
-  }
-
-  // invio messaggio utente
-  const send = await fetch(`https://api.elevenlabs.io/v1/convai/conversations/${elevenConvId}/messages`, {
+async function convaiSendMessage(conversationId, userText) {
+  const url = `https://api.elevenlabs.io/v1/convai/conversations/${conversationId}/messages`;
+  const r = await fetch(url, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "xi-api-key": ELEVEN_API_KEY
-    },
+    headers: { "Content-Type": "application/json", "xi-api-key": ELEVEN_API_KEY },
     body: JSON.stringify({ role: "user", content: userText })
   });
-
-  const jsend = await send.json().catch(() => ({}));
-
-  // molte risposte convai includono direttamente la reply dell'assistente
-  let reply = jsend?.assistant_response || jsend?.reply;
-
-  // altrimenti cerca l'ultimo messaggio con role=assistant
-  if (!reply && Array.isArray(jsend?.messages)) {
-    const lastAssistant = [...jsend.messages].reverse().find(m => m.role === "assistant");
-    reply = lastAssistant?.content;
+  const bodyText = await r.text();
+  let j = {};
+  try { j = JSON.parse(bodyText); } catch {}
+  console.log("[CONVAI message] status:", r.status, "| body:", short(bodyText));
+  // prova estrazione reply
+  let reply = j?.assistant_response || j?.reply;
+  if (!reply && Array.isArray(j?.messages)) {
+    const last = [...j.messages].reverse().find(m => m.role === "assistant");
+    reply = last?.content;
   }
-
-  return { ok: !!reply, reply, info: jsend };
+  return { status: r.status, reply, raw: j };
 }
 
-/** ---- handler principale webhook Chatwoot ---- */
+// Variante B (fallback): endpoint “direct message senza conversation”
+async function convaiAgentDirectMessage(userText) {
+  const url = `https://api.elevenlabs.io/v1/convai/agents/${ELEVEN_AGENT_ID}/message`;
+  const r = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "xi-api-key": ELEVEN_API_KEY },
+    body: JSON.stringify({ content: userText })
+  });
+  const bodyText = await r.text();
+  let j = {};
+  try { j = JSON.parse(bodyText); } catch {}
+  console.log("[CONVAI direct] status:", r.status, "| body:", short(bodyText));
+  const reply = j?.assistant_response || j?.reply || j?.text || j?.message;
+  return { status: r.status, reply, raw: j };
+}
+
+// -------------------- CHATWOOT HANDLER --------------------
 const chatwootHandler = async (req, res) => {
   try {
     const ev = req.body || {};
     const e = ev?.data ? ev.data : ev;
 
-    console.log("[WEBHOOK]", ev?.event || e?.event, "| type:", e?.message_type, "| conv:", e?.conversation?.id);
+    console.log(
+      "[WEBHOOK]",
+      ev?.event || e?.event,
+      "| type:", e?.message_type,
+      "| conv:", e?.conversation?.id
+    );
 
     const eventName = ev?.event || e?.event;
     if (eventName !== "message_created") return res.sendStatus(200);
@@ -107,30 +106,38 @@ const chatwootHandler = async (req, res) => {
       return res.sendStatus(200);
     }
 
-    // ---- 1) PROVA endpoint "semplice" ----
     let finalReply = null;
 
+    // 1) Tentativo “simple”
     try {
       const simple = await elevenSimpleRespond(content);
-      console.log("[ELEVEN(simple)] status:", simple.status, "| raw:", short(JSON.stringify(simple.data)));
-
+      console.log("[ELEVEN(simple)] status:", simple.status, "| raw:", short(simple.data));
       if (simple.status < 400 && (simple.data?.reply || simple.data?.text)) {
         finalReply = simple.data.reply || simple.data.text;
-      } else if (simple.status === 404) {
-        // ---- 2) FALLBACK convai (ufficiale per chat) ----
-        const conv = await elevenConvaiReply(conversationId, content);
-        console.log("[ELEVEN(convai)] ok:", conv.ok, "| raw:", short(JSON.stringify(conv.info)));
-        if (conv.ok) finalReply = conv.reply;
       }
     } catch (err) {
-      console.log("[ELEVEN ERROR]", err?.message);
+      console.log("[ELEVEN(simple) ERROR]", err?.message);
     }
 
+    // 2) Se non abbiamo reply, convai: create + message
     if (!finalReply) {
-      finalReply = "Ok! Sono qui 👍 Dimmi pure: come posso aiutarti?";
+      const create = await convaiCreateConversation();
+      if (create.id) {
+        const msg = await convaiSendMessage(create.id, content);
+        if (msg.reply) finalReply = msg.reply;
+      } else if (create.status === 404 || create.status === 400) {
+        // 3) Fallback: direct message (senza conversation persistente)
+        const direct = await convaiAgentDirectMessage(content);
+        if (direct.reply) finalReply = direct.reply;
+      }
     }
 
-    // ---- 3) invia la risposta in Chatwoot ----
+    // 4) Se ancora nulla, rispondi con fallback gentile
+    if (!finalReply) {
+      finalReply = "Sono qui! Dimmi pure come posso aiutarti 🙂";
+    }
+
+    // 5) Invia su Chatwoot (che inoltra su WhatsApp)
     const cwUrl = `${CW_BASE}/api/v1/accounts/${CW_ACCOUNT_ID}/conversations/${conversationId}/messages`;
     const cwResp = await fetch(cwUrl, {
       method: "POST",
@@ -143,7 +150,6 @@ const chatwootHandler = async (req, res) => {
         content: finalReply
       })
     });
-
     const cwText = await cwResp.text();
     console.log("[CHATWOOT POST] status:", cwResp.status, "| body:", short(cwText));
 
@@ -154,7 +160,7 @@ const chatwootHandler = async (req, res) => {
   }
 };
 
-// ---- routes ----
+// -------------------- ROUTES --------------------
 app.post("/chatwoot-bot", chatwootHandler);
 app.get("/", (_req, res) => res.status(200).send("OK"));
 app.post("/", (req, res, next) => { req.url = "/chatwoot-bot"; next(); });

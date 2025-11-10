@@ -1,5 +1,5 @@
 // server.js
-// Bot ponte: Chatwoot (webhook) ↔ ElevenLabs Agent ↔ Chatwoot (API) → WhatsApp
+// Chatwoot (webhook) ↔ ElevenLabs Conversational AI ↔ Chatwoot (API) → WhatsApp
 
 import express from "express";
 import fetch from "node-fetch";
@@ -7,71 +7,131 @@ import fetch from "node-fetch";
 const app = express();
 app.use(express.json({ limit: "2mb" }));
 
-// --- ENV --------------------------------------------------------------------
 const {
   PORT = 3000,
-  CW_BASE,           // es: https://chatwoot-production-b47d.up.railway.app
-  CW_ACCOUNT_ID,     // es: 1
-  CW_API_TOKEN,      // Settings → Access Tokens in Chatwoot
-  ELEVEN_API_KEY,    // ElevenLabs API key
-  ELEVEN_AGENT_ID    // es: agent_xxxxx
+  CW_BASE,
+  CW_ACCOUNT_ID,
+  CW_API_TOKEN,
+  ELEVEN_API_KEY,
+  ELEVEN_AGENT_ID
 } = process.env;
 
-// Piccolo helper per log brevi
 const short = (s, n = 160) => (typeof s === "string" ? s.slice(0, n) : s);
 
-// --- HANDLER PRINCIPALE -----------------------------------------------------
+// Mappa: conversationId Chatwoot -> conversationId ElevenLabs (convai)
+const cwToEleven = new Map();
+
+/** ---- helper: chiama endpoint "semplice" (se disponibile) ---- */
+async function elevenSimpleRespond(text) {
+  const url = `https://api.elevenlabs.io/v1/agents/${ELEVEN_AGENT_ID}/respond`;
+  const r = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "xi-api-key": ELEVEN_API_KEY
+    },
+    body: JSON.stringify({ input: text })
+  });
+  let j = {};
+  try { j = await r.json(); } catch {}
+  return { status: r.status, data: j };
+}
+
+/** ---- helper: crea/recupera una conversation convai ---- */
+async function elevenEnsureConversation(cwConvId) {
+  // se già esiste, la riuso
+  if (cwToEleven.has(cwConvId)) return cwToEleven.get(cwConvId);
+
+  // creo nuova conversation
+  const r = await fetch("https://api.elevenlabs.io/v1/convai/conversations", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "xi-api-key": ELEVEN_API_KEY
+    },
+    body: JSON.stringify({ agent_id: ELEVEN_AGENT_ID })
+  });
+  const j = await r.json().catch(() => ({}));
+  const elevenConvId = j?.conversation_id || j?.id;
+  if (elevenConvId) cwToEleven.set(cwConvId, elevenConvId);
+  return elevenConvId;
+}
+
+/** ---- helper: invia un messaggio e ottieni la reply testuale (convai) ---- */
+async function elevenConvaiReply(cwConvId, userText) {
+  const elevenConvId = await elevenEnsureConversation(cwConvId);
+  if (!elevenConvId) {
+    return { ok: false, reply: null, info: "no_conversation" };
+  }
+
+  // invio messaggio utente
+  const send = await fetch(`https://api.elevenlabs.io/v1/convai/conversations/${elevenConvId}/messages`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "xi-api-key": ELEVEN_API_KEY
+    },
+    body: JSON.stringify({ role: "user", content: userText })
+  });
+
+  const jsend = await send.json().catch(() => ({}));
+
+  // molte risposte convai includono direttamente la reply dell'assistente
+  let reply = jsend?.assistant_response || jsend?.reply;
+
+  // altrimenti cerca l'ultimo messaggio con role=assistant
+  if (!reply && Array.isArray(jsend?.messages)) {
+    const lastAssistant = [...jsend.messages].reverse().find(m => m.role === "assistant");
+    reply = lastAssistant?.content;
+  }
+
+  return { ok: !!reply, reply, info: jsend };
+}
+
+/** ---- handler principale webhook Chatwoot ---- */
 const chatwootHandler = async (req, res) => {
   try {
     const ev = req.body || {};
-    // Chatwoot spesso incapsula i dati in ev.data
     const e = ev?.data ? ev.data : ev;
 
-    console.log("[WEBHOOK]",
-      ev?.event || e?.event,
-      "| type:", e?.message_type,
-      "| conv:", e?.conversation?.id
-    );
+    console.log("[WEBHOOK]", ev?.event || e?.event, "| type:", e?.message_type, "| conv:", e?.conversation?.id);
 
-    // Processa solo messaggi IN ARRIVO
     const eventName = ev?.event || e?.event;
     if (eventName !== "message_created") return res.sendStatus(200);
     if (e?.message_type !== "incoming") return res.sendStatus(200);
 
     const content = (e?.content || "").trim();
     const conversationId = e?.conversation?.id;
-
     if (!content || !conversationId) {
       console.log("[SKIP] content/convId mancanti");
       return res.sendStatus(200);
     }
 
-    // --- 1) Chiedi risposta TESTUALE all'Agent ElevenLabs -------------------
-    // ⚠️ Endpoint indicativo per Agents/Conversational AI.
-    // Sostituiscilo se nel tuo account l'endpoint è diverso.
-    const elResp = await fetch(
-      `https://api.elevenlabs.io/v1/agents/${ELEVEN_AGENT_ID}/respond`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "xi-api-key": ELEVEN_API_KEY
-        },
-        body: JSON.stringify({ input: content })
+    // ---- 1) PROVA endpoint "semplice" ----
+    let finalReply = null;
+
+    try {
+      const simple = await elevenSimpleRespond(content);
+      console.log("[ELEVEN(simple)] status:", simple.status, "| raw:", short(JSON.stringify(simple.data)));
+
+      if (simple.status < 400 && (simple.data?.reply || simple.data?.text)) {
+        finalReply = simple.data.reply || simple.data.text;
+      } else if (simple.status === 404) {
+        // ---- 2) FALLBACK convai (ufficiale per chat) ----
+        const conv = await elevenConvaiReply(conversationId, content);
+        console.log("[ELEVEN(convai)] ok:", conv.ok, "| raw:", short(JSON.stringify(conv.info)));
+        if (conv.ok) finalReply = conv.reply;
       }
-    );
+    } catch (err) {
+      console.log("[ELEVEN ERROR]", err?.message);
+    }
 
-    let elJson = {};
-    try { elJson = await elResp.json(); } catch { elJson = {}; }
-    const reply =
-      elJson?.reply ||
-      "Posso aiutarti, puoi riformulare la domanda?";
+    if (!finalReply) {
+      finalReply = "Ok! Sono qui 👍 Dimmi pure: come posso aiutarti?";
+    }
 
-    console.log("[ELEVENLABS] status:", elResp.status, "| reply:", short(reply));
-
-    // --- 2) Invia la risposta su Chatwoot (verrà inoltrata su WhatsApp) -----
+    // ---- 3) invia la risposta in Chatwoot ----
     const cwUrl = `${CW_BASE}/api/v1/accounts/${CW_ACCOUNT_ID}/conversations/${conversationId}/messages`;
-
     const cwResp = await fetch(cwUrl, {
       method: "POST",
       headers: {
@@ -80,14 +140,13 @@ const chatwootHandler = async (req, res) => {
       },
       body: JSON.stringify({
         message_type: "outgoing",
-        content: reply
+        content: finalReply
       })
     });
 
     const cwText = await cwResp.text();
     console.log("[CHATWOOT POST] status:", cwResp.status, "| body:", short(cwText));
 
-    // Rispondi sempre 200 a Chatwoot (evita retry)
     return res.sendStatus(200);
   } catch (err) {
     console.error("BOT ERROR:", err);
@@ -95,22 +154,13 @@ const chatwootHandler = async (req, res) => {
   }
 };
 
-// --- ROUTES -----------------------------------------------------------------
-// Endpoint ufficiale del webhook Chatwoot
+// ---- routes ----
 app.post("/chatwoot-bot", chatwootHandler);
-
-// Healthcheck + fallback per ping alla root
 app.get("/", (_req, res) => res.status(200).send("OK"));
-// Se Chatwoot (o qualcuno) fa POST "/" per sbaglio, reindirizza all'handler
 app.post("/", (req, res, next) => { req.url = "/chatwoot-bot"; next(); });
 
-// ----------------------------------------------------------------------------
 app.listen(PORT, () => {
   console.log(`Bot listening on :${PORT}`);
-  if (!CW_BASE || !CW_ACCOUNT_ID || !CW_API_TOKEN) {
-    console.warn("[WARN] Manca qualche variabile Chatwoot (CW_BASE/CW_ACCOUNT_ID/CW_API_TOKEN).");
-  }
-  if (!ELEVEN_API_KEY || !ELEVEN_AGENT_ID) {
-    console.warn("[WARN] Manca ELEVEN_API_KEY o ELEVEN_AGENT_ID.");
-  }
+  if (!CW_BASE || !CW_ACCOUNT_ID || !CW_API_TOKEN) console.warn("[WARN] Manca CW_* env.");
+  if (!ELEVEN_API_KEY || !ELEVEN_AGENT_ID) console.warn("[WARN] Manca ELEVEN_* env.");
 });
